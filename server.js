@@ -153,6 +153,14 @@ app.get("/", (req, res) => {
 // Map a user's permanent pubKey to their temporary socket.id
 const userSockets = {};
 
+// Map a pubKey to the list of sockets that are subscribed to it
+// { "contact_PubKey": ["subscriber_socket_id_1", "subscriber_socket_id_2"] }
+const presenceSubscriptions = {};
+
+// Map a socket.id to the list of pubKeys it is subscribed to (for easy cleanup)
+// { "subscriber_socket_id_1": ["contact_PubKey_A", "contact_PubKey_B"] }
+const socketSubscriptions = {};
+
 // Helper to normalize keys
 function normKey(k){ return (typeof k === 'string') ? k.replace(/\s+/g,'') : k; }
 
@@ -170,6 +178,49 @@ io.on("connection", (socket) => {
     userSockets[key] = socket.id;
     socket.data.pubKey = key; // Store key on socket for later cleanup
     console.log(`🔑 Registered: ${key.slice(0,12)}... -> ${socket.id}`);
+    
+  // --- Notify subscribers that this user is now online ---
+    const subscribers = presenceSubscriptions[key];
+    if (subscribers && subscribers.length) {
+      console.log(`📢 Notifying ${subscribers.length} subscribers that ${key.slice(0,12)}... is online.`);
+      subscribers.forEach(subscriberSocketId => {
+        io.to(subscriberSocketId).emit("presence-update", { pubKey: key, status: "online" });
+      });
+    }
+  });
+  
+  
+  
+  // Handle presence subscription
+  socket.on("subscribe-to-presence", (contactPubKeys) => {
+    console.log(`📡 Presence subscription from ${socket.id} for ${contactPubKeys.length} contacts.`);
+
+    // --- 1. Clean up any previous subscriptions for this socket ---
+    const oldSubscriptions = socketSubscriptions[socket.id];
+    if (oldSubscriptions && oldSubscriptions.length) {
+      oldSubscriptions.forEach(pubKey => {
+        if (presenceSubscriptions[pubKey]) {
+          presenceSubscriptions[pubKey] = presenceSubscriptions[pubKey].filter(id => id !== socket.id);
+          if (presenceSubscriptions[pubKey].length === 0) {
+            delete presenceSubscriptions[pubKey];
+          }
+        }
+      });
+    }
+
+    // --- 2. Create the new subscriptions ---
+    socketSubscriptions[socket.id] = contactPubKeys;
+    contactPubKeys.forEach(pubKey => {
+      const key = normKey(pubKey);
+      if (!presenceSubscriptions[key]) {
+        presenceSubscriptions[key] = [];
+      }
+      presenceSubscriptions[key].push(socket.id);
+    });
+
+    // --- 3. Reply with the initial online status of the subscribed contacts ---
+    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normKey(key)]);
+    socket.emit("presence-initial-status", initialOnlineContacts);
   });
 
   // Handle direct connection requests
@@ -250,10 +301,35 @@ socket.on("call-ended", ({ to, from }) => {
 
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
-    // Clean up the user mapping on disconnect
-    if (socket.data.pubKey) {
-      delete userSockets[socket.data.pubKey];
-      console.log(`🗑️ Unregistered: ${socket.data.pubKey.slice(0, 12)}...`);
+    const pubKey = socket.data.pubKey;
+
+    if (pubKey) {
+      // --- 1. Notify subscribers that this user is now offline ---
+      const subscribers = presenceSubscriptions[pubKey];
+      if (subscribers && subscribers.length) {
+        console.log(`📢 Notifying ${subscribers.length} subscribers that ${pubKey.slice(0,12)}... is offline.`);
+        subscribers.forEach(subscriberSocketId => {
+          io.to(subscriberSocketId).emit("presence-update", { pubKey: pubKey, status: "offline" });
+        });
+      }
+
+      // --- 2. Clean up all subscriptions this socket made ---
+      const subscriptionsMadeByThisSocket = socketSubscriptions[socket.id];
+      if (subscriptionsMadeByThisSocket && subscriptionsMadeByThisSocket.length) {
+        subscriptionsMadeByThisSocket.forEach(subscribedToKey => {
+          if (presenceSubscriptions[subscribedToKey]) {
+            presenceSubscriptions[subscribedToKey] = presenceSubscriptions[subscribedToKey].filter(id => id !== socket.id);
+            if (presenceSubscriptions[subscribedToKey].length === 0) {
+              delete presenceSubscriptions[subscribedToKey];
+            }
+          }
+        });
+      }
+      delete socketSubscriptions[socket.id];
+
+      // --- 3. Finally, remove user from the main online list ---
+      delete userSockets[pubKey];
+      console.log(`🗑️ Unregistered and cleaned up subscriptions for: ${pubKey.slice(0, 12)}...`);
     }
   });
 });
